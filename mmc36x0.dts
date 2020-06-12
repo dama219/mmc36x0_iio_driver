@@ -1,0 +1,7 @@
+	mmc36x0@30 {
+		compatible = "memsic,mmc36x0";
+		reg = <0x30>;
+		interrupt-parent = <&gpio1>;
+		interrupts = <13 IRQ_TYPE_LEVEL_LOW>;
+		status = "okay";
+	};
