@@ -898,7 +898,7 @@ static struct i2c_driver mmc36x0_driver = {
 
 module_i2c_driver(mmc36x0_driver);
 
-MODULE_AUTHOR("Daniel Baluta <daniel.baluta@intel.com>");
+MODULE_AUTHOR("yinghua.ma");
 MODULE_DESCRIPTION("MEMSIC MMC36X0 magnetic sensor driver");
 MODULE_LICENSE("GPL v2");
 
