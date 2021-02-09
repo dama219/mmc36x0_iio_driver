@@ -24,6 +24,7 @@
 #include <linux/iio/buffer.h>
 #include <linux/iio/trigger_consumer.h>
 #include <linux/iio/triggered_buffer.h>
+#include <linux/workqueue.h>
 
 //#define MMC36X0_DEBUG
 
@@ -71,6 +72,7 @@
 #define MMC36X0_STATUS_MOTION_DETECT_BIT	BIT(2)
 #define MMC36X0_STATUS_INTERRUPT_MASK		(MMC36X0_STATUS_MEAS_M_DONE_BIT | \
 			MMC36X0_STATUS_MEAS_T_DONE_BIT | MMC36X0_STATUS_MOTION_DETECT_BIT)
+#define MMC36X0_STATUS_PUMP_ON_BIT			BIT(3)
 
 #define MMC36X0_CTRL0_REFILL_BIT    BIT(5)
 #define MMC36X0_CTRL0_RESET_BIT     BIT(4)
@@ -97,7 +99,7 @@
 #define MMC36X0_TESTMODE_OTP_MR		0x80
 
 #define MMC36X0_WAIT_CHARGE_PUMP	50000	/* us */
-#define MMC53240_WAIT_SET_RESET		1000	/* us */
+#define MMC53240_WAIT_SET_RESET		2000	/* us */
 
 /*
  * Memsic OTP process code piece is put here for reference:
@@ -140,27 +142,10 @@ enum mmc36x0_axis {
 static const struct {
 	int sens[3]; /* sensitivity per X, Y, Z axis */
 	int nfo; /* null field output */
-} mmc36x0_props_table[] = {
-	/* 16 bits, 125Hz ODR */
-	{
-		{1024, 1024, 1024},
-		32768,
-	},
-	/* 16 bits, 250Hz ODR */
-	{
-		{1024, 1024, 770},
-		32768,
-	},
-	/* 14 bits, 450Hz ODR */
-	{
-		{256, 256, 193},
-		8192,
-	},
-	/* 12 bits, 800Hz ODR */
-	{
-		{64, 64, 48},
-		2048,
-	},
+} mmc36x0_props = {
+	/* 16 bits*/
+	{1024, 1024, 1024},
+	32768,
 };
 
 struct mmc36x0_data {
@@ -176,6 +161,8 @@ struct mmc36x0_data {
 	struct iio_trigger *dready_trig;
 	bool dready_trigger_on;
 	bool single_supply;//Dual Supply or Single Supply
+	struct delayed_work set_work;
+	u64 timestamp;
 };
 
 static const struct {
@@ -196,7 +183,7 @@ static IIO_CONST_ATTR_SAMP_FREQ_AVAIL("100 200 400 600");
 	.channel2 = IIO_MOD_ ## _axis, \
 	.address = AXIS_ ## _axis, \
 	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE), \
-	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SAMP_FREQ), \
+	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ), \
 	.scan_index = index, \
 	.scan_type = { \
 		.sign = 's', \
@@ -250,6 +237,7 @@ static __maybe_unused int mmc36x0_hw_set(struct mmc36x0_data *data, bool set)
 	 * before a SET/RESET command.
 	 */
 	if (data->single_supply) {
+		pr_info("%s: single_supply\n", __func__);
 		ret = regmap_write_bits(data->regmap, MMC36X0_REG_CTRL0,
 					 MMC36X0_CTRL0_REFILL_BIT,
 					 MMC36X0_CTRL0_REFILL_BIT);
@@ -257,7 +245,7 @@ static __maybe_unused int mmc36x0_hw_set(struct mmc36x0_data *data, bool set)
 			dev_err(&data->client->dev, "%s: write MMC36X0_REG_CTRL0 failed\n", __func__);
 			return ret;
 		}
-		usleep_range(MMC36X0_WAIT_CHARGE_PUMP, MMC36X0_WAIT_CHARGE_PUMP + 1);
+		usleep_range(MMC36X0_WAIT_CHARGE_PUMP, MMC36X0_WAIT_CHARGE_PUMP + 1000);
 	}
 
 	if (set)
@@ -265,9 +253,13 @@ static __maybe_unused int mmc36x0_hw_set(struct mmc36x0_data *data, bool set)
 	else
 		coil_bit = MMC36X0_CTRL0_RESET_BIT;
 
-	return regmap_write_bits(data->regmap, MMC36X0_REG_CTRL0,
+	ret = regmap_write_bits(data->regmap, MMC36X0_REG_CTRL0,
 				  coil_bit, coil_bit);
-
+	if (!ret)
+		usleep_range(MMC53240_WAIT_SET_RESET, MMC53240_WAIT_SET_RESET + 200);
+	else
+		dev_err(&data->client->dev, "write MMC36X0_REG_CTRL0 set/reset failed, ret=%d\n", ret);
+	return ret;
 }
 
 /* Get sensitivity compensation value */
@@ -329,17 +321,23 @@ static int mmc36x0_init(struct mmc36x0_data *data)
 	int ret;
 	unsigned int reg_id;
 
-	ret = regmap_read(data->regmap, MMC36X0_REG_ID, &reg_id);
-	if (ret) {
-		dev_err(&data->client->dev, "Error reading product id\n");
+	/*reset chip to default state*/
+	ret = regmap_write(data->regmap, MMC36X0_REG_CTRL1, MMC36X0_CTRL1_SW_RESET);
+	if (!ret) {
+		usleep_range(5000, 5000 + 200);
+	} else {
+		dev_err(&data->client->dev, "%s: reset failed, ret=%d\n", __func__, ret);
 		return ret;
 	}
 
-	dev_info(&data->client->dev, "MMC36X0 chip id %x\n", reg_id);
-
-	/*reset chip to default state*/
-	ret = regmap_write(data->regmap, MMC36X0_REG_CTRL1, MMC36X0_CTRL1_SW_RESET);
-	usleep_range(5000, 5000 + 200);
+	ret = regmap_read(data->regmap, MMC36X0_REG_ID, &reg_id);
+	if (!ret) {
+		dev_info(&data->client->dev, "MMC36X0 chip id is :0x%x\n", reg_id);
+		regmap_write(data->regmap, MMC36X0_REG_CTRL1, 0);
+	} else {
+		dev_err(&data->client->dev, "Error reading product id\n");
+		return ret;
+	}
 
 	/*
 	 * make sure we restore sensor characteristics, by doing
@@ -349,19 +347,10 @@ static int mmc36x0_init(struct mmc36x0_data *data)
 	ret = mmc36x0_hw_set(data, true);
 	if (ret)
 		return ret;
-	usleep_range(MMC53240_WAIT_SET_RESET, MMC53240_WAIT_SET_RESET + 1);
 
 	ret = mmc36x0_hw_set(data, false);
 	if (ret)
 		return ret;
-
-	/* set default sampling frequency */
-	ret = regmap_write_bits(data->regmap, MMC36X0_REG_CTRL1,
-				 MMC36X0_CTRL1_BW_MASK,
-				 data->res << MMC36X0_CTRL1_BW_SHIFT);
-	if (ret) {
-		return ret;
-	}
 
 	ret = mmc36x0_get_comp_matrix(data);
 	return ret;
@@ -416,8 +405,6 @@ static int mmc36x0_raw_to_mgauss(struct mmc36x0_data *data, int index,
 				  __le16 buf[], s16*val)
 {
 	int raw[3];
-	int sens[3];
-	int nfo;
 
 	raw[AXIS_X] = le16_to_cpu(buf[AXIS_X]);
 	raw[AXIS_Y] = le16_to_cpu(buf[AXIS_Y]);
@@ -425,23 +412,17 @@ static int mmc36x0_raw_to_mgauss(struct mmc36x0_data *data, int index,
 
 	mmc36x0_debug("index=%d, rawX=%d, rawY=%d, rawZ=%d\n", index, raw[AXIS_X], raw[AXIS_Y], raw[AXIS_Z]);
 
-	sens[AXIS_X] = mmc36x0_props_table[data->res].sens[AXIS_X];
-	sens[AXIS_Y] = mmc36x0_props_table[data->res].sens[AXIS_Y];
-	sens[AXIS_Z] = mmc36x0_props_table[data->res].sens[AXIS_Z];
-
-	nfo = mmc36x0_props_table[data->res].nfo;
-
 	switch (index) {
 	case AXIS_X:
-		*val = (raw[AXIS_X] - nfo) * 1000 / sens[AXIS_X];
+		*val = (raw[AXIS_X] - mmc36x0_props.nfo) * 1000 / mmc36x0_props.sens[AXIS_X];
 		break;
 	case AXIS_Y:
-		*val = (raw[AXIS_Y] - nfo) * 1000 / sens[AXIS_Y] -
-			(raw[AXIS_Z] - nfo)  * 1000 / sens[AXIS_Z];
+		*val = (raw[AXIS_Y] - mmc36x0_props.nfo) * 1000 / mmc36x0_props.sens[AXIS_Y] -
+			(raw[AXIS_Z] - mmc36x0_props.nfo)  * 1000 / mmc36x0_props.sens[AXIS_Z];
 		break;
 	case AXIS_Z:
-		*val = (raw[AXIS_Y] - nfo) * 1000 / sens[AXIS_Y] +
-			(raw[AXIS_Z] - nfo) * 1000 / sens[AXIS_Z];
+		*val = (raw[AXIS_Y] - mmc36x0_props.nfo) * 1000 / mmc36x0_props.sens[AXIS_Y] +
+			(raw[AXIS_Z] - mmc36x0_props.nfo) * 1000 / mmc36x0_props.sens[AXIS_Z];
 		break;
 	default:
 		return -EINVAL;
@@ -486,9 +467,7 @@ static int mmc36x0_read_raw(struct iio_dev *indio_dev,
 		*val2 = 1000;
 		return IIO_VAL_INT_PLUS_MICRO;
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		mutex_lock(&data->mutex);
 		ret = regmap_read(data->regmap, MMC36X0_REG_CTRL1, &reg);
-		mutex_unlock(&data->mutex);
 		if (ret < 0)
 			return ret;
 
@@ -516,15 +495,19 @@ static int mmc36x0_write_raw(struct iio_dev *indio_dev,
 		i = mmc36x0_get_samp_freq_index(data, val, val2);
 		if (i < 0)
 			return -EINVAL;
+
 		mutex_lock(&data->mutex);
 		ret = regmap_write_bits(data->regmap, MMC36X0_REG_CTRL1,
 					 MMC36X0_CTRL1_BW_MASK,
 					 i << MMC36X0_CTRL1_BW_SHIFT);
+		if (!ret)
+			data->res = i;
 		mutex_unlock(&data->mutex);
 		return ret;
 	default:
 		return -EINVAL;
 	}
+	return 0;
 }
 
 static const struct iio_info mmc36x0_info = {
@@ -620,11 +603,8 @@ static int mmc36x0_buffer_preenable(struct iio_dev *indio_dev)
 	ret = mmc36x0_hw_set(data, true);
 	if (ret) {
 		dev_err(&data->client->dev, "%s: hw set failed\n", __func__);
-		return ret;
 	}
-	usleep_range(MMC53240_WAIT_SET_RESET, MMC53240_WAIT_SET_RESET + 1);
-
-	return 0;
+	return ret;
 }
 
 static const struct iio_buffer_setup_ops mmc36x0_buffer_setup_ops = {
@@ -646,7 +626,7 @@ static int mmc36x0_set_trigge_state(struct iio_trigger *trig,
 
 	/*clear interrupt*/
 	ret = regmap_write_bits(data->regmap, MMC36X0_REG_STATUS,
-				 	MMC36X0_STATUS_INTERRUPT_MASK, 0x07);
+					MMC36X0_STATUS_INTERRUPT_MASK, 0x07);
 	if (ret) {
 		dev_err(&data->client->dev, "write MMC36X0_REG_STATUS failed\n");
 		goto err_unlock;
@@ -666,6 +646,9 @@ static int mmc36x0_set_trigge_state(struct iio_trigger *trig,
 				MMC36X0_CTRL0_TMM_BIT, MMC36X0_CTRL0_TMM_BIT);
 		if (ret)
 			goto err_unlock;
+		schedule_delayed_work(&data->set_work, 5000);
+	} else {
+		cancel_delayed_work_sync(&data->set_work);
 	}
 
 	data->dready_trigger_on = state;
@@ -680,10 +663,17 @@ static const struct iio_trigger_ops mmc36x0_trigger_ops = {
 	.owner = THIS_MODULE,
 };
 
-irqreturn_t mmc36x0_trigger_handler(int irq, void *p)
+irqreturn_t mmc36x0_irq_handler(int irq, void *p)
 {
-	struct iio_poll_func *pf = p;
-	struct iio_dev *indio_dev = pf->indio_dev;
+	struct iio_dev *indio_dev = p;
+	struct mmc36x0_data *data = iio_priv(indio_dev);
+	data->timestamp = iio_get_time_ns();
+	return IRQ_WAKE_THREAD;
+}
+
+irqreturn_t mmc36x0_irq_thread_handler(int irq, void *p)
+{
+	struct iio_dev *indio_dev = p;
 	struct mmc36x0_data *data = iio_priv(indio_dev);
 	__le16 raw[3];
 	s16 mgauss[8];
@@ -691,51 +681,68 @@ irqreturn_t mmc36x0_trigger_handler(int irq, void *p)
 	int i;
 	int ret;
 
-	mutex_lock(&data->mutex);
 	ret = regmap_read(data->regmap, MMC36X0_REG_STATUS, &status);
 	if (ret) {
-		dev_err(&indio_dev->dev, "read status failed, ret=%d\n", ret);
-		goto out;
+		dev_err(&indio_dev->dev, "%s: read status failed, ret=%d\n",__func__, ret);
+		goto err;
 	}
 
 	/*whether a measurement event of magnetic field is completed*/
-	if (status & MMC36X0_STATUS_MEAS_M_DONE_BIT) {
-		ret = mmc36x0_read_measure_result(data, raw);
+	if (status & MMC36X0_STATUS_INTERRUPT_MASK) {
+		if (status & MMC36X0_STATUS_MEAS_M_DONE_BIT) {
+			ret = mmc36x0_read_measure_result(data, raw);
+			if (ret) {
+				dev_err(&indio_dev->dev, "read xyz data failed, ret=%d\n", ret);
+				goto err;
+			}
+		}
+
+		/*clear interrupt*/
+		ret = regmap_write_bits(data->regmap, MMC36X0_REG_STATUS,
+					MMC36X0_STATUS_INTERRUPT_MASK, 0x07);
 		if (ret) {
-			dev_err(&indio_dev->dev, "read xyz data failed, ret=%d\n", ret);
-			goto out;
+			dev_err(&indio_dev->dev, "%s: clear interrupt failed, ret=%d\n",__func__, ret);
+			goto err;
 		}
 
-		for (i = 0; i < 3; i++) {
-			mmc36x0_raw_to_mgauss(data, i, raw, &mgauss[i]);
-			mmc36x0_debug(&data->client->dev, "mgauss[%d]=%d\n", i, mgauss[i]);
+		/*start magnetic field measurement again*/
+		ret = regmap_write_bits(data->regmap, MMC36X0_REG_CTRL0, MMC36X0_CTRL0_TMM_BIT, MMC36X0_CTRL0_TMM_BIT);
+		if (ret) {
+				dev_err(&indio_dev->dev, "%s: write MMC36X0_REG_CTRL0 failed, ret=%d\n", __func__, ret);
+				goto err;
 		}
-		iio_push_to_buffers_with_timestamp(indio_dev, mgauss, pf->timestamp);
+
+		if (status & MMC36X0_STATUS_MEAS_M_DONE_BIT) {
+			for (i = 0; i < 3; i++) {
+				mmc36x0_raw_to_mgauss(data, i, raw, &mgauss[i]);
+				mmc36x0_debug("mgauss[%d]=%d\n", i, mgauss[i]);
+			}
+			iio_push_to_buffers_with_timestamp(indio_dev, mgauss, data->timestamp);
+		}
 	}
-
-	/*clear interrupt*/
-	ret = regmap_write_bits(data->regmap, MMC36X0_REG_STATUS,
-				 	MMC36X0_STATUS_INTERRUPT_MASK, 0x07);
-
-	/*start magnetic field measurement again*/
-	ret = regmap_write_bits(data->regmap, MMC36X0_REG_CTRL0, MMC36X0_CTRL0_TMM_BIT, MMC36X0_CTRL0_TMM_BIT);
-	if (ret) {
-			dev_err(&indio_dev->dev, "%s: write MMC36X0_REG_CTRL0 failed, ret=%d\n", __func__, ret);
-			goto out;
-	}
-out:
-	mutex_unlock(&data->mutex);
-	iio_trigger_notify_done(indio_dev->trig);
-
+	return IRQ_HANDLED;
+err:
+	cancel_delayed_work(&data->set_work);
+	schedule_delayed_work(&data->set_work, 0);
 	return IRQ_HANDLED;
 }
+
+irqreturn_t mmc36x0_trigger_handler(int irq, void *p)
+{
+	struct iio_poll_func *pf = p;
+	struct iio_dev *indio_dev = pf->indio_dev;
+
+	iio_trigger_notify_done(indio_dev->trig);
+	return IRQ_HANDLED;
+}
+
 
 static int mmc36x0_probe_trigger(struct mmc36x0_data *data)
 {
 	int ret = 0;
 	struct i2c_client *client = data->client;
 	struct iio_dev *indio_dev = i2c_get_clientdata(client);
-	//unsigned long irq_type = irqd_get_trigger_type(irq_get_irq_data(data->irq));;
+	unsigned long irq_type = irqd_get_trigger_type(irq_get_irq_data(data->irq));
 
 	data->dready_trig = devm_iio_trigger_alloc(&client->dev,
 						   "%s-dev%d",
@@ -756,18 +763,18 @@ static int mmc36x0_probe_trigger(struct mmc36x0_data *data)
 	}
 
 	ret = devm_request_threaded_irq(&client->dev, client->irq,
-				   iio_trigger_generic_data_rdy_poll,
-				   NULL,
-				   IRQF_TRIGGER_FALLING| IRQF_ONESHOT,
+				   mmc36x0_irq_handler,
+				   mmc36x0_irq_thread_handler,
+				   irq_type | IRQF_ONESHOT,
 				   MMC36X0_DRV_NAME,
-				   data->dready_trig);
+				   indio_dev);
 	if (ret) {
 		dev_err(&client->dev, "request irq %d failed, ret=%d\n", client->irq, ret);
 		goto out;
 	}
 
 	ret = iio_triggered_buffer_setup(indio_dev,
-					 iio_pollfunc_store_time,
+					 NULL,
 					 mmc36x0_trigger_handler,
 					 &mmc36x0_buffer_setup_ops);
 	if (ret) {
@@ -779,6 +786,36 @@ out:
 	iio_trigger_unregister(data->dready_trig);
 	return ret;
 
+}
+
+static void set_work_function(struct work_struct *work)
+{
+	int ret;
+	struct delayed_work *delayed_work = container_of(work, struct delayed_work, work);
+	struct mmc36x0_data *data = container_of(delayed_work, struct mmc36x0_data, set_work);
+
+	disable_irq(data->irq);
+	ret = mmc36x0_hw_set(data, true);
+	if (ret) {
+		dev_err(&data->client->dev, "%s: hw set failed\n", __func__);
+	}
+
+	/*clear interrupt*/
+	ret = regmap_write_bits(data->regmap, MMC36X0_REG_STATUS,
+					MMC36X0_STATUS_INTERRUPT_MASK, 0x07);
+	if (ret) {
+		dev_err(&data->client->dev, "write MMC36X0_REG_STATUS failed\n");
+	}
+
+	enable_irq(data->irq);
+
+	/*start magnetic field measurement again*/
+	ret = regmap_write_bits(data->regmap, MMC36X0_REG_CTRL0, MMC36X0_CTRL0_TMM_BIT, MMC36X0_CTRL0_TMM_BIT);
+	if (ret) {
+		dev_err(&data->client->dev, "%s: write MMC36X0_REG_CTRL0 failed, ret=%d\n", __func__, ret);
+	}
+
+	schedule_delayed_work(&data->set_work, 5000);
 }
 
 static int mmc36x0_probe(struct i2c_client *client,
@@ -803,9 +840,10 @@ static int mmc36x0_probe(struct i2c_client *client,
 	i2c_set_clientdata(client, indio_dev);
 	data->client = client;
 	data->regmap = regmap;
-	data->res = MMC36X0_16_BITS_SLOW;
+	data->res = MMC36X0_16_BITS_FAST;
 	data->irq = client->irq;
 	mutex_init(&data->mutex);
+	INIT_DELAYED_WORK(&data->set_work, set_work_function);
 	if (of_property_read_bool(client->dev.of_node, "single-supply"))
 		data->single_supply = true;
 
@@ -829,6 +867,9 @@ static int mmc36x0_probe(struct i2c_client *client,
 		goto out;
 	}
 	ret = devm_iio_device_register(&client->dev, indio_dev);
+	if (ret)
+		dev_err(&client->dev, "register iio device failed, ret=%d\n", ret);
+	return ret;
 out:
 	mutex_destroy(&data->mutex);
 	return ret;
@@ -898,7 +939,7 @@ static struct i2c_driver mmc36x0_driver = {
 
 module_i2c_driver(mmc36x0_driver);
 
-MODULE_AUTHOR("yinghua.ma");
+MODULE_AUTHOR("yinghua.ma <yinghua.ma@ninebot.com>");
 MODULE_DESCRIPTION("MEMSIC MMC36X0 magnetic sensor driver");
 MODULE_LICENSE("GPL v2");
 
